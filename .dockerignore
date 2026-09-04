@@ -1,0 +1,2 @@
+# Keep the build context small: .git is large and never needed in the image.
+.git

@@ -1,0 +1,91 @@
+# Tester-env source build for ownCloud (prospect stage).
+# Builds editable upstream source on php:8.3-apache with SQLite.
+# Layer order is mutation-friendly: slow dependency steps (apt extensions,
+# composer install) are cached; small PHP source edits only re-run the COPY
+# + autoload layers.
+FROM php:8.3-apache-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    COMPOSER_ALLOW_SUPERUSER=1
+
+# ownCloud runtime extensions (composer.json require + sqlite driver).
+# imagick + memcached are hard composer requirements, installed via pecl.
+# Skipped on purpose: redis, ldap, smbclient, ftp (optional).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libfreetype6-dev libjpeg62-turbo-dev libpng-dev libwebp-dev \
+        libzip-dev libicu-dev libsqlite3-dev libmemcached-dev \
+        libmagickwand-dev libonig-dev libcurl4-openssl-dev \
+        libxml2-dev libssl-dev libsasl2-dev \
+        zlib1g-dev unzip sudo \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
+    && docker-php-ext-install -j"$(nproc)" \
+        gd intl zip exif mbstring curl fileinfo bcmath pcntl \
+        pdo pdo_sqlite \
+    && rm -rf /var/lib/apt/lists/* \
+    && a2enmod rewrite headers env mime
+
+# PECL extensions in their own layer for faster iteration.
+RUN pecl install apcu \
+    && docker-php-ext-enable apcu
+RUN pecl install imagick \
+    && docker-php-ext-enable imagick
+RUN pecl install memcached \
+    && docker-php-ext-enable memcached
+
+# PHP tuning for occ + composer (test env values, not production).
+RUN { \
+        echo 'memory_limit=1G'; \
+        echo 'upload_max_filesize=512M'; \
+        echo 'post_max_size=512M'; \
+        echo 'opcache.enable=1'; \
+        echo 'opcache.memory_consumption=256'; \
+        echo 'opcache.interned_strings_buffer=32'; \
+        echo 'opcache.max_accelerated_files=10000'; \
+        echo 'apc.enable_cli=1'; \
+    } > /usr/local/etc/php/conf.d/tester-env.ini
+
+# Apache must honour ownCloud's .htaccess (pretty URLs, security headers).
+RUN { \
+        echo '<Directory /var/www/html/>'; \
+        echo '    AllowOverride All'; \
+        echo '    Require all granted'; \
+        echo '</Directory>'; \
+    } > /etc/apache2/conf-available/owncloud-tester-env.conf \
+    && a2enconf owncloud-tester-env
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+# Node toolchain for ownCloud's frontend vendor bundle. core/vendor is NOT
+# committed upstream; the Makefile builds it via `yarn install` in build/
+# (whose postinstall links build/node_modules/@bower_components to
+# core/vendor). Kept in its own cached layers so PHP-only mutations stay fast.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g yarn@1.22.22 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /var/www/html
+
+# Dependency layers first: rebuild only when manifests change.
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-interaction --prefer-dist --no-scripts --no-autoloader
+
+COPY build/ ./build/
+RUN cd build && yarn install --frozen-lockfile --non-interactive
+
+# Editable source layer: small mutations only invalidate from here down.
+COPY . /var/www/html/
+RUN ln -sfn /var/www/html/build/node_modules/@bower_components /var/www/html/core/vendor \
+    && composer dump-autoload --no-dev --optimize --no-scripts \
+    && mkdir -p /var/www/data \
+    && chown -R www-data:www-data /var/www/html/config /var/www/data
+
+COPY docker-entrypoint-tester-env.sh /usr/local/bin/docker-entrypoint-tester-env.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint-tester-env.sh
+
+EXPOSE 80
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-tester-env.sh"]
+CMD ["apache2-foreground"]

@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# ownCloud - Tester Environment CLI (prospect stage).
+# Lives in .work/prospects/owncloud until the app is forked, then moves to
+# the fork submodule root unchanged.
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status
+set -euo pipefail
+
+RUN_ID="default"
+PORT="${PORT:-8088}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    CONTAINER_NAME="tester-env-owncloud${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-owncloud:dev}"
+    DATA_VOLUME="owncloud-data${suffix}"
+}
+
+wait_for_http() {
+    echo "==> Waiting for ownCloud at http://localhost:${PORT}..."
+    for _ in $(seq 1 60); do
+        if curl -fsS -o /dev/null "http://localhost:${PORT}/status.php" 2>/dev/null; then
+            echo "==> ownCloud is responding."
+            return 0
+        fi
+        sleep 3
+    done
+    echo "ownCloud did not become ready at http://localhost:${PORT}" >&2
+    return 1
+}
+
+cmd_deploy() {
+    echo "==> Building ownCloud image ${IMAGE_NAME} from editable source..."
+    docker build \
+        --label "tester-env.project=tester-env" \
+        --label "tester-env.app=owncloud" \
+        --label "tester-env.run_id=${RUN_ID}" \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+
+    echo "==> Starting container ${CONTAINER_NAME} on port ${PORT}..."
+    docker volume create \
+        --label "tester-env.project=tester-env" \
+        --label "tester-env.app=owncloud" \
+        --label "tester-env.run_id=${RUN_ID}" \
+        "${DATA_VOLUME}" >/dev/null
+    docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+    docker run -d --name "${CONTAINER_NAME}" \
+        --label "tester-env.project=tester-env" \
+        --label "tester-env.app=owncloud" \
+        --label "tester-env.run_id=${RUN_ID}" \
+        -p "${PORT}:80" \
+        -v "${DATA_VOLUME}:/var/www/data" \
+        -e "APP_PORT=${PORT}" \
+        "${IMAGE_NAME}" >/dev/null
+
+    wait_for_http
+
+    echo "==> Deployment complete. App running at http://localhost:${PORT}"
+    echo "    Credentials: admin / admin12345"
+}
+
+cmd_seed() {
+    echo "==> Seeding deterministic Northwind Design Studio data..."
+    CONTAINER="${CONTAINER_NAME}" PORT="${PORT}" bash "${SCRIPT_DIR}/tester-env-seed.sh"
+}
+
+cmd_verify() {
+    echo "==> Verifying ownCloud install..."
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ status' | grep -q 'installed: *true' \
+        || { echo "occ status does not report installed:true" >&2; return 1; }
+    echo "==> occ status: installed."
+    if ! curl -fsS "http://localhost:${PORT}/status.php" | grep -q '"installed":true'; then
+        echo "status.php does not report installed:true" >&2
+        return 1
+    fi
+    echo "==> status.php: installed."
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ user:list' | grep -q 'admin' \
+        || { echo "admin user not found" >&2; return 1; }
+    echo "==> admin user present."
+    echo "==> login page: content check (form markup must render, not just HTTP 200)."
+    login_html="$(curl -fsS "http://localhost:${PORT}/index.php/login")"
+    echo "${login_html}" | grep -q 'name="user"' \
+        || { echo "login HTML missing username input" >&2; return 1; }
+    echo "${login_html}" | grep -q 'type="password"' \
+        || { echo "login HTML missing password input" >&2; return 1; }
+    echo "${login_html}" | grep -q 'id="submit"' \
+        || { echo "login HTML missing submit button" >&2; return 1; }
+    echo "==> login HTML: form markup present."
+    curl -fsS -o /dev/null "http://localhost:${PORT}/core/vendor/jquery/dist/jquery.min.js" \
+        || { echo "core/vendor frontend bundle missing (rebuild via deploy)" >&2; return 1; }
+    echo "==> core/vendor: frontend bundle served."
+    echo "==> seed state: users, group, files, favorite, version, shares."
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ user:list' | grep -q 'tester' \
+        || { echo "tester user not found" >&2; return 1; }
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ user:list' | grep -q 'teammate' \
+        || { echo "teammate user not found" >&2; return 1; }
+    echo "==> users tester + teammate present."
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ group:list-members studio' | grep -q 'tester' \
+        || { echo "tester not in studio group" >&2; return 1; }
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ group:list-members studio' | grep -q 'teammate' \
+        || { echo "teammate not in studio group" >&2; return 1; }
+    echo "==> group studio (tester, teammate) present."
+    listing="$(curl -fsS -u tester:tester12345 -X PROPFIND -H 'Depth: 1' \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/")"
+    for name in 'Projects' 'Invoices' 'Notes' 'welcome.txt'; do
+        echo "${listing}" | grep -q "${name}/\|${name}<\|>${name}<\|/${name}\"" \
+            || { echo "seeded path missing from tester files: ${name}" >&2; return 1; }
+    done
+    sub="$(curl -fsS -u tester:tester12345 -X PROPFIND -H 'Depth: 1' \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Projects/Website-Redesign/")"
+    for name in 'brief.txt' 'launch-checklist.md'; do
+        echo "${sub}" | grep -q "${name}" \
+            || { echo "seeded path missing from Website-Redesign: ${name}" >&2; return 1; }
+    done
+    inv="$(curl -fsS -u tester:tester12345 -X PROPFIND -H 'Depth: 1' \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Invoices/")"
+    echo "${inv}" | grep -q 'invoice-2026-08.txt' \
+        || { echo "seeded invoice missing" >&2; return 1; }
+    notes="$(curl -fsS -u tester:tester12345 -X PROPFIND -H 'Depth: 1' \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Notes/")"
+    echo "${notes}" | grep -q 'meeting-notes-2026-08-28.md' \
+        || { echo "seeded meeting notes missing" >&2; return 1; }
+    echo "==> seeded files/folders present."
+    curl -fsS -u tester:tester12345 \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Projects/Website-Redesign/brief.txt" \
+        | grep -q 'Launch readiness: GREEN' \
+        || { echo "brief.txt content mismatch" >&2; return 1; }
+    echo "==> brief.txt content ok."
+    curl -fsS -u tester:tester12345 -X PROPFIND \
+        -H 'Content-Type: application/xml' \
+        --data '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:favorite/></d:prop></d:propfind>' \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Projects/Website-Redesign/brief.txt" \
+        | grep -q '<oc:favorite>1</oc:favorite>' \
+        || { echo "brief.txt favorite flag missing" >&2; return 1; }
+    echo "==> brief.txt favorite set."
+    nversions="$(docker exec "${CONTAINER_NAME}" bash -c \
+        "ls /var/www/data/tester/files_versions/Projects/Website-Redesign/brief.txt.v* 2>/dev/null | wc -l")"
+    [[ "${nversions}" == "1" ]] \
+        || { echo "expected exactly 1 stored version of brief.txt, found ${nversions}" >&2; return 1; }
+    echo "==> brief.txt has exactly 1 stored version."
+    nversions_total="$(docker exec "${CONTAINER_NAME}" bash -c \
+        "find /var/www/data/tester/files_versions /var/www/data/teammate/files_versions -type f 2>/dev/null | wc -l")"
+    [[ "${nversions_total}" == "1" ]] \
+        || { echo "expected 1 stored version in total, found ${nversions_total}" >&2; return 1; }
+    echo "==> no stray versions."
+    shares="$(curl -fsS -u tester:tester12345 -H 'OCS-APIRequest: true' \
+        "http://localhost:${PORT}/ocs/v1.php/apps/files_sharing/api/v1/shares?format=json")"
+    echo "${shares}" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin)["ocs"]["data"]; assert any(s["path"]=="/Projects" and s["share_type"]==0 and s["share_with"]=="teammate" for s in d), "user share missing"' \
+        || { echo "Projects user share to teammate missing" >&2; return 1; }
+    echo "${shares}" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin)["ocs"]["data"]; assert sum(1 for s in d if s["path"]=="/Projects")==1, "Projects share count != 1"; assert sum(1 for s in d if s["path"]=="/Invoices/invoice-2026-08.txt" and s["share_type"]==3)==1, "invoice link share missing"' \
+        || { echo "share count/link-share mismatch" >&2; return 1; }
+    echo "==> shares (Projects -> teammate, invoice link) ok."
+    echo "==> Verify passed. ownCloud running at http://localhost:${PORT}/"
+    echo "    Credentials: admin / admin12345"
+}
+
+cmd_reset() {
+    echo "==> Resetting ownCloud (${CONTAINER_NAME} + ${DATA_VOLUME})..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    docker volume rm "${DATA_VOLUME}" 2>/dev/null || true
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping ${CONTAINER_NAME} (data preserved)..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f --tail=200 "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if docker ps --filter "name=^${CONTAINER_NAME}$" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+ownCloud tester-env CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+   deploy    Build from editable source, start container, auto-install (SQLite)
+   seed      Deterministic Northwind Studio data (tester-env-seed.sh)
+   verify    Check occ status, status.php, login page, vendor bundle, and seed state
+  reset     Stop container and remove data volume (clean slate, keeps image)
+  stop      Stop container (preserves data)
+  logs      Follow container logs
+  status    Show container status and URL
+
+Options:
+  --run-id <id>   Isolate container and volume names (default: default)
+  --port <port>   Host port mapped to container port 80 (default: 8088)
+
+Credentials: admin / admin12345
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
