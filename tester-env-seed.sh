@@ -54,6 +54,17 @@ occ group:add studio >/dev/null 2>&1 || true
 occ group:add-member studio -m tester -m teammate >/dev/null 2>&1 || true
 echo "    group studio (tester, teammate) ok"
 
+# 1a. Markup-named group for the group-name-escaping scenario: the angle
+# brackets are part of the literal group name. Only tester is a member;
+# studiowiki stays restricted to studio so nav fixtures are unaffected.
+# NOTE: the occ() helper cannot carry this name (the container shell would
+# parse the unquoted angle brackets as redirections), so quote it explicitly.
+docker exec "${CONTAINER}" su -s /bin/bash www-data \
+    -c 'php /var/www/html/occ group:add "<b>spotlight-deals</b>"' >/dev/null 2>&1 || true
+docker exec "${CONTAINER}" su -s /bin/bash www-data \
+    -c 'php /var/www/html/occ group:add-member "<b>spotlight-deals</b>" -m tester' >/dev/null 2>&1 || true
+echo "    group <b>spotlight-deals</b> (tester) ok"
+
 # 1b. Group-restricted nav app (Studio Wiki): shipped in the source tree at
 # apps/studiowiki (baked into the image), enabled ONLY for group studio.
 # admin is explicitly kept out of studio so the admin header app menu shows
