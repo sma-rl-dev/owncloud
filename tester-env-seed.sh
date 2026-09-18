@@ -54,6 +54,14 @@ occ group:add studio >/dev/null 2>&1 || true
 occ group:add-member studio -m tester -m teammate >/dev/null 2>&1 || true
 echo "    group studio (tester, teammate) ok"
 
+# 1b. Group-restricted nav app (Studio Wiki): shipped in the source tree at
+# apps/studiowiki (baked into the image), enabled ONLY for group studio.
+# admin is explicitly kept out of studio so the admin header app menu shows
+# Files only, while studio members see the extra Studio Wiki entry.
+occ group:remove-member studio -m admin >/dev/null 2>&1 || true
+occ app:enable -g studio studiowiki >/dev/null 2>&1
+echo "    studio wiki app (group-restricted to studio) ok"
+
 # 2. Clean slate for counts: delete every seeded path (collection DELETE is
 #    recursive), then clear trashbin + versions, so each run recreates files
 #    fresh: only brief.txt (v1 -> v2 below) ends up with a stored version.

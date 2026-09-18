@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<info>
+	<id>studiowiki</id>
+	<name>Studio Wiki</name>
+	<description>Northwind Design Studio team wiki (deterministic seed fixture for group-restricted navigation).</description>
+	<licence>AGPL</licence>
+	<author>Northwind Design Studio</author>
+	<version>1.0.0</version>
+	<dependencies>
+		<owncloud min-version="10" max-version="11" />
+	</dependencies>
+	<navigation>
+		<static>index.html</static>
+		<order>20</order>
+		<name>Studio Wiki</name>
+	</navigation>
+</info>

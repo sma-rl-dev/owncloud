@@ -114,6 +114,44 @@ cmd_verify() {
         -c 'php /var/www/html/occ group:list-members studio' | grep -q 'teammate' \
         || { echo "teammate not in studio group" >&2; return 1; }
     echo "==> group studio (tester, teammate) present."
+    admin_in_studio="$(docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ group:list-members studio' 2>/dev/null || true)"
+    echo "${admin_in_studio}" | grep -q 'admin' \
+        && { echo "admin must not be a member of studio (group-restricted nav fixture)" >&2; return 1; }
+    echo "==> admin correctly excluded from studio."
+    docker exec "${CONTAINER_NAME}" su -s /bin/bash www-data \
+        -c 'php /var/www/html/occ config:app:get studiowiki enabled' | grep -q '\["studio"\]' \
+        || { echo "studiowiki app not enabled exclusively for group studio" >&2; return 1; }
+    echo "==> studiowiki enabled only for group studio."
+    curl -fsS "http://localhost:${PORT}/apps/studiowiki/index.html" | grep -q 'Studio Wiki' \
+        || { echo "studiowiki landing page not served" >&2; return 1; }
+    echo "==> studiowiki landing page served."
+    echo "==> header nav: admin sees Files only, studio member sees Studio Wiki."
+    nav_for() { # nav_for <user> <pass> <cookie-jar>: print rendered files page
+        local rt
+        rt="$(curl -fsS -c "$3" "http://localhost:${PORT}/index.php/login" \
+            | grep -o 'data-requesttoken="[^"]*"' | head -1 | cut -d'"' -f2)"
+        curl -fsS -c "$3" -b "$3" -e "http://localhost:${PORT}/index.php/login" \
+            -X POST "http://localhost:${PORT}/index.php/login" \
+            --data-urlencode "user=$1" --data-urlencode "password=$2" \
+            --data-urlencode "requesttoken=${rt}" \
+            --data-urlencode "timezone-offset=0" >/dev/null
+        curl -fsS -b "$3" "http://localhost:${PORT}/index.php/apps/files/"
+    }
+    nav_tmp="$(mktemp -d)"
+    admin_nav="$(nav_for admin admin12345 "${nav_tmp}/admin.jar")"
+    echo "${admin_nav}" | grep -q 'data-id="files"' \
+        || { echo "admin header nav missing Files entry" >&2; rm -rf "${nav_tmp}"; return 1; }
+    echo "${admin_nav}" | grep -q 'data-id="studiowiki"' \
+        && { echo "admin header nav leaks Studio Wiki (must show Files only)" >&2; rm -rf "${nav_tmp}"; return 1; }
+    echo "==> admin header nav: Files only."
+    tester_nav="$(nav_for tester tester12345 "${nav_tmp}/tester.jar")"
+    echo "${tester_nav}" | grep -q 'data-id="files"' \
+        || { echo "tester header nav missing Files entry" >&2; rm -rf "${nav_tmp}"; return 1; }
+    echo "${tester_nav}" | grep -q 'data-id="studiowiki"' \
+        || { echo "tester header nav missing Studio Wiki entry" >&2; rm -rf "${nav_tmp}"; return 1; }
+    rm -rf "${nav_tmp}"
+    echo "==> tester header nav: Files + Studio Wiki."
     listing="$(curl -fsS -u tester:tester12345 -X PROPFIND -H 'Depth: 1' \
         "http://localhost:${PORT}/remote.php/dav/files/tester/")"
     for name in 'Projects' 'Invoices' 'Notes' 'welcome.txt'; do
