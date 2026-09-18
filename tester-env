@@ -167,7 +167,7 @@ cmd_verify() {
     done
     sub="$(curl -fsS -u tester:tester12345 -X PROPFIND -H 'Depth: 1' \
         "http://localhost:${PORT}/remote.php/dav/files/tester/Projects/Website-Redesign/")"
-    for name in 'brief.txt' 'launch-checklist.md'; do
+    for name in 'brief.txt' 'launch-checklist.md' 'team-photo.png'; do
         echo "${sub}" | grep -q "${name}" \
             || { echo "seeded path missing from Website-Redesign: ${name}" >&2; return 1; }
     done
@@ -192,6 +192,30 @@ cmd_verify() {
         | grep -q '<oc:favorite>1</oc:favorite>' \
         || { echo "brief.txt favorite flag missing" >&2; return 1; }
     echo "==> brief.txt favorite set."
+    curl -fsS -u tester:tester12345 -X PROPFIND \
+        -H 'Content-Type: application/xml' \
+        --data '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:getcontenttype/><d:getcontentlength/></d:prop></d:propfind>' \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Projects/Website-Redesign/team-photo.png" \
+        | grep -q 'image/png' \
+        || { echo "team-photo.png not served as image/png" >&2; return 1; }
+    echo "==> team-photo.png content-type image/png."
+    curl -fsS -u tester:tester12345 \
+        "http://localhost:${PORT}/remote.php/dav/files/tester/Projects/Website-Redesign/team-photo.png" \
+        -o "${TMPDIR:-/tmp}/team-photo-check.png"
+    python3 - "${TMPDIR:-/tmp}/team-photo-check.png" <<'PYEOF' \
+        || { echo "team-photo.png PNG validation failed" >&2; return 1; }
+import struct
+import sys
+p = sys.argv[1]
+b = open(p, 'rb').read()
+assert b[:8] == b'\x89PNG\r\n\x1a\n', 'not a PNG'
+assert len(b) == 33142, f'size drift: {len(b)}'
+w, h = struct.unpack('>II', b[16:24])
+assert (w, h) == (320, 200), f'dims drift: {w}x{h}'
+assert w != h, 'avatar fixture must be non-square'
+PYEOF
+    rm -f "${TMPDIR:-/tmp}/team-photo-check.png"
+    echo "==> team-photo.png deterministic non-square PNG (320x200, 33142 B)."
     nversions="$(docker exec "${CONTAINER_NAME}" bash -c \
         "ls /var/www/data/tester/files_versions/Projects/Website-Redesign/brief.txt.v* 2>/dev/null | wc -l")"
     [[ "${nversions}" == "1" ]] \

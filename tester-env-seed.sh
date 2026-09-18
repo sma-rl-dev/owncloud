@@ -146,7 +146,42 @@ Deadline: 2026-09-12
 Owner: Alex Rivera
 Launch readiness: GREEN
 EOF
-echo "    files (5, brief.txt at v2 with 1 stored version) ok"
+
+# team-photo.png: deterministic non-square (320x200) RGB PNG for the avatar
+# cropper scenario (square images skip the cropper). Generated offline with
+# stdlib-only python (zlib+struct, compress level 9): byte-identical on every
+# run (33142 bytes, md5 15028fb1bb57cdfbabc7b800ededfe59). PUT once per seed;
+# the Projects wipe above keeps it version-free like the other seeded files.
+python3 - <<'PYEOF' | curl -fsS -u "${TESTER_AUTH}" -X PUT \
+    "${BASE}/remote.php/dav/files/tester/Projects/Website-Redesign/team-photo.png" \
+    --data-binary @- >/dev/null
+import struct
+import sys
+import zlib
+W, H = 320, 200
+raw = bytearray()
+for y in range(H):
+    raw.append(0)
+    for x in range(W):
+        if (x - 260) ** 2 + (y - 55) ** 2 < 30 ** 2:
+            px = (250, 200, 60)
+        elif y < 130:
+            px = (x * 255 // W, 120 + y // 2, 220)
+        elif y < 150:
+            px = (70, 140, 70)
+        else:
+            px = (40, 90, 160)
+        raw += bytes(px)
+def chunk(t, d):
+    c = struct.pack('>I', len(d)) + t + d
+    return c + struct.pack('>I', zlib.crc32(t + d) & 0xFFFFFFFF)
+sys.stdout.buffer.write(
+    b'\x89PNG\r\n\x1a\n'
+    + chunk(b'IHDR', struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0))
+    + chunk(b'IDAT', zlib.compress(bytes(raw), 9))
+    + chunk(b'IEND', b''))
+PYEOF
+echo "    files (6, brief.txt at v2 with 1 stored version + team-photo.png 320x200) ok"
 
 # 5. Favorite on brief.txt (PROPPATCH is idempotent).
 curl -fsS -u "${TESTER_AUTH}" -X PROPPATCH \
